@@ -262,9 +262,16 @@ MONTHS = {
     "JUL": 7, "AGO": 8, "SEP": 9, "SET": 9, "OCT": 10, "NOV": 11, "DIC": 12,
 }
 
-SEP = r"\s*[/\-.]\s*"
+# Separadores que el OCR suele devolver en lugar de "-" o "/" (guiones Unicode, _, ~, ",")
+_SEP_CHARS = "/\\-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212_~,"
+SEP = rf"\s*[{_SEP_CHARS}]\s*"
+# Año de 4 cifras: no puede ir seguido de otra cifra, salvo que sea la hora pegada
+# ("09-11-202614:35"). El de 2 cifras no puede ir seguido de cifra.
+_YEAR = r"(\d{4}(?:(?!\d)|(?=\d{1,2}[:.h]\d{2}))|\d{2}(?!\d))"
 # dd/mm/aaaa  dd-mm-aa  dd.mm.aaaa  (también d/m/aa)
-RE_DMY = re.compile(rf"(?<!\d)(\d{{1,2}}){SEP}(\d{{1,2}}){SEP}(\d{{4}}|\d{{2}})(?!\d)")
+RE_DMY = re.compile(rf"(?<!\d)(\d{{1,2}}){SEP}(\d{{1,2}}){SEP}{_YEAR}")
+# Igual pero permitiendo cifras delante ("T0109-11-2026"): sólo se usa si lo anterior no encuentra nada
+RE_DMY_LOOSE = re.compile(rf"(\d{{2}}){SEP}(\d{{1,2}}){SEP}{_YEAR}")
 # 17 NOV 2026 / 17-NOV-26 / 12 de enero de 2024
 RE_DMONY = re.compile(
     r"(?<!\d)(\d{1,2})\s*(?:DE\s+|[/\-.\s])?\s*("
@@ -273,16 +280,23 @@ RE_DMONY = re.compile(
 )
 KEYWORDS = ("FECHA", "FEC.", "FEC:", "DATA")
 
-_OCR_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "l": "1", "I": "1", "|": "1",
-                          "S": "5", "B": "8"})
+_OCR_FIX = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "l": "1", "I": "1", "|": "1",
+                          "i": "1", "!": "1", "Z": "2", "z": "2", "S": "5", "s": "5",
+                          "B": "8", "g": "9", "q": "9"})
+_OCR_CHARS = r"\dOoDQlIi|!ZzSsBgq"
 
 
 def _fix_ocr_digits(text: str) -> str:
-    """Corrige confusiones típicas del OCR (O->0, l/I->1...) sólo en trozos con forma de fecha.
-    Mantiene la longitud del texto, así las posiciones siguen valiendo para dibujar."""
+    """Corrige confusiones típicas del OCR (O->0, l/I->1, Z->2...) y unifica separadores
+    sólo en trozos con forma de fecha. Mantiene la longitud del texto (sustituciones 1 a 1),
+    así las posiciones siguen valiendo para dibujar."""
+    def fix(m: re.Match) -> str:
+        t = m.group(0).translate(_OCR_FIX)
+        return re.sub(rf"[{_SEP_CHARS}]", lambda c: "/" if c.group(0) == "/" else "-", t)
+
     return re.sub(
-        r"[\dOoDlI|SB]{1,4}(?:\s*[/\-.]\s*[\dOoDlI|SB]{1,4}){2}",
-        lambda m: m.group(0).translate(_OCR_FIX),
+        rf"[{_OCR_CHARS}]{{1,6}}(?:\s*[{_SEP_CHARS}]\s*[{_OCR_CHARS}]{{1,6}}){{2}}",
+        fix,
         text,
     )
 
@@ -316,10 +330,14 @@ def extract_dates(texts: list[str]) -> list[DateMatch]:
             i > 0 and any(k in texts[i - 1].upper() for k in KEYWORDS)
         )
         fixed = _fix_ocr_digits(raw).upper()
-        for m in RE_DMY.finditer(fixed):
-            dt = _make_date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            if dt:
-                found.append(DateMatch(dt, m.group(0), i, m.start(), m.end(), has_kw))
+        n_before = len(found)
+        for rx in (RE_DMY, RE_DMY_LOOSE):
+            for m in rx.finditer(fixed):
+                dt = _make_date(int(m.group(1)), int(m.group(2)), int(m.group(3)[:4]))
+                if dt:
+                    found.append(DateMatch(dt, m.group(0), i, m.start(), m.end(), has_kw))
+            if len(found) > n_before:
+                break
         for m in RE_DMONY.finditer(up):
             dt = _make_date(int(m.group(1)), MONTHS[m.group(2)], int(m.group(3)))
             if dt:
