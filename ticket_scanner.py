@@ -32,7 +32,18 @@ except AttributeError:
 # Cámaras
 # --------------------------------------------------------------------------------------
 
-CAP_BACKEND = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+if sys.platform == "win32":
+    CAP_BACKEND = cv2.CAP_DSHOW
+elif sys.platform == "darwin":
+    CAP_BACKEND = cv2.CAP_AVFOUNDATION
+else:
+    CAP_BACKEND = cv2.CAP_ANY
+
+MAC_CAMERA_HINT = (
+    "En macOS la app desde la que lanzas Python (Terminal, iTerm, VS Code...) necesita "
+    "permiso de cámara: Ajustes del Sistema > Privacidad y seguridad > Cámara. "
+    "Actívalo, cierra y vuelve a abrir esa app, y ejecuta de nuevo."
+)
 
 
 class Camera:
@@ -482,6 +493,8 @@ def open_cameras(indices: list[int], log=print) -> dict[int, Camera]:
             log(f"Cámara {idx} abierta")
         except RuntimeError as e:
             log(f"AVISO: {e}")
+    if not cams and sys.platform == "darwin":
+        log(MAC_CAMERA_HINT)
     return cams
 
 
@@ -508,6 +521,8 @@ def main() -> None:
         print("Buscando cámaras...")
         if not list_cameras():
             print("  No se ha encontrado ninguna cámara.")
+            if sys.platform == "darwin":
+                print(MAC_CAMERA_HINT)
         return
 
     log("Cargando motor OCR...")
