@@ -12,6 +12,8 @@ dd.mm.aaaa, "17 NOV 2026", "12 de enero de 2024"...).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import re
 import sys
 import threading
@@ -46,13 +48,37 @@ MAC_CAMERA_HINT = (
 )
 
 
+DEFAULT_CAMS = [0, 1]  # índices que se prueban si no se indica --cams
+
+
+@contextlib.contextmanager
+def _quiet_stderr():
+    """Silencia los mensajes nativos de OpenCV/AVFoundation/DirectShow al abrir una cámara
+    que no existe (escriben directamente en stderr y no hacen caso a setLogLevel)."""
+    try:
+        sys.stderr.flush()
+        saved = os.dup(2)
+    except (OSError, ValueError):
+        yield
+        return
+    try:
+        with open(os.devnull, "w") as devnull:
+            os.dup2(devnull.fileno(), 2)
+            yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+
+
 class Camera:
     """Captura en un hilo propio para tener siempre el último frame disponible."""
 
     def __init__(self, index: int, width: int = 1920, height: int = 1080):
         self.index = index
-        self.cap = cv2.VideoCapture(index, CAP_BACKEND)
+        with _quiet_stderr():
+            self.cap = cv2.VideoCapture(index, CAP_BACKEND)
         if not self.cap.isOpened():
+            self.cap.release()
             raise RuntimeError(f"No se pudo abrir la cámara {index}")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
@@ -84,14 +110,14 @@ class Camera:
 def list_cameras(max_index: int = 6) -> list[int]:
     found = []
     for i in range(max_index):
-        cap = cv2.VideoCapture(i, CAP_BACKEND)
-        if cap.isOpened():
-            ok, frame = cap.read()
-            if ok:
-                h, w = frame.shape[:2]
-                print(f"  Cámara {i}: OK ({w}x{h})")
-                found.append(i)
+        with _quiet_stderr():
+            cap = cv2.VideoCapture(i, CAP_BACKEND)
+            ok, frame = cap.read() if cap.isOpened() else (False, None)
         cap.release()
+        if ok:
+            h, w = frame.shape[:2]
+            print(f"  Cámara {i}: OK ({w}x{h})")
+            found.append(i)
     return found
 
 
@@ -531,14 +557,18 @@ class Scanner(threading.Thread):
                            else "Leyendo... (fecha no encontrada todavía)")
 
 
-def open_cameras(indices: list[int], log=print) -> dict[int, Camera]:
+def open_cameras(indices: list[int] | None, log=print) -> dict[int, Camera]:
+    """Abre las cámaras indicadas. Con `indices=None` prueba DEFAULT_CAMS y usa las que
+    haya, sin avisar de las que falten (lo normal es tener sólo una)."""
+    auto = indices is None
     cams: dict[int, Camera] = {}
-    for idx in indices:
+    for idx in DEFAULT_CAMS if auto else indices:
         try:
             cams[idx] = Camera(idx)
             log(f"Cámara {idx} abierta")
         except RuntimeError as e:
-            log(f"AVISO: {e}")
+            if not auto:
+                log(f"AVISO: {e}")
     if not cams and sys.platform == "darwin":
         log(MAC_CAMERA_HINT)
     return cams
@@ -555,7 +585,8 @@ def log(msg: str) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Lee la fecha de tickets con OCR desde dos cámaras.")
-    ap.add_argument("--cams", type=int, nargs="+", default=[0, 1], help="índices de cámara (por defecto 0 1)")
+    ap.add_argument("--cams", type=int, nargs="+", default=None,
+                    help="índices de cámara (por defecto usa las que haya entre 0 y 1)")
     ap.add_argument("--list", action="store_true", help="listar cámaras disponibles y salir")
     ap.add_argument("--threshold", type=float, default=0.06,
                     help="fracción mínima de imagen ocupada por el ticket para considerarlo presente")

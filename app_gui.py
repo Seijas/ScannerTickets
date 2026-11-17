@@ -4,7 +4,7 @@ ScannerTickets - interfaz gráfica.
 Muestra la cámara en tiempo real, detecta en cuál hay un ticket, le pasa el OCR
 y dibuja un rectángulo verde sobre la fecha que ha leído.
 
-    python app_gui.py              # cámaras 0 y 1
+    python app_gui.py              # usa las cámaras que haya (0 y/o 1)
     python app_gui.py --cams 0 1 2
 """
 
@@ -47,29 +47,30 @@ def fit(frame: np.ndarray, w: int, h: int) -> tuple[np.ndarray, float, int, int]
 
 
 class App:
-    def __init__(self, root: tk.Tk, cam_indices: list[int]):
+    def __init__(self, root: tk.Tk, cam_indices: list[int] | None):
         self.root = root
         self.events: queue.Queue[str] = queue.Queue()
         root.title("Scanner Tickets")
         root.configure(bg="#1e1e1e")
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self._build_ui(cam_indices)
+        self._build_ui()
         self.log("Cargando motor OCR...")
         root.update()
 
         self.ocr = OCREngine()
         self.cams = open_cameras(cam_indices, self.log)
         if not self.cams:
-            self.log("No hay cámaras disponibles.")
+            self.log("No hay cámaras disponibles. Prueba: python ticket_scanner.py --list")
             return
+        self._build_cam_widgets(list(self.cams))
         self.scanner = Scanner(self.cams, self.ocr, on_event=self.events.put)
         self.scanner.start()
         self.last_cam = next(iter(self.cams))
         self.tick()
 
     # ------------------------------------------------------------------ UI
-    def _build_ui(self, cam_indices: list[int]) -> None:
+    def _build_ui(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
         for w in ("TFrame", "TLabel", "TRadiobutton", "TCheckbutton", "TLabelframe", "TLabelframe.Label"):
@@ -100,22 +101,13 @@ class App:
         self.status_lbl = ttk.Label(side, text="", style="Status.TLabel", wraplength=THUMB_W)
         self.status_lbl.pack(fill="x", pady=(6, 6))
 
-        mode = ttk.LabelFrame(side, text=" Cámara ", padding=6)
-        mode.pack(fill="x")
+        # Selector de cámara y miniaturas: se rellenan cuando se sabe qué cámaras hay
         self.mode = tk.StringVar(value="auto")
-        ttk.Radiobutton(mode, text="Automática (la que tenga ticket)", value="auto",
-                        variable=self.mode, command=self._mode_changed).pack(anchor="w")
-        for i in cam_indices:
-            ttk.Radiobutton(mode, text=f"Cámara {i}", value=str(i),
-                            variable=self.mode, command=self._mode_changed).pack(anchor="w")
-
+        self.mode_box = ttk.LabelFrame(side, text=" Cámara ", padding=6)
+        self.mode_box.pack(fill="x")
+        self.thumbs_box = ttk.Frame(side)
+        self.thumbs_box.pack(fill="x")
         self.thumbs: dict[int, tuple[tk.Label, ttk.Label]] = {}
-        for i in cam_indices:
-            img = tk.Label(side, bg="black", width=THUMB_W, height=THUMB_H)
-            img.pack(pady=(8, 0))
-            cap = ttk.Label(side, text=f"Cámara {i}", style="Cam.TLabel")
-            cap.pack(anchor="w")
-            self.thumbs[i] = (img, cap)
 
         opts = ttk.Frame(side)
         opts.pack(fill="x", pady=(8, 0))
@@ -129,6 +121,23 @@ class App:
         self.logbox = tk.Text(main, height=8, bg="#111", fg="#ccc", insertbackground="#ccc",
                               font=("Consolas", 9), relief="flat")
         self.logbox.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+
+    def _build_cam_widgets(self, cam_indices: list[int]) -> None:
+        if len(cam_indices) > 1:
+            ttk.Radiobutton(self.mode_box, text="Automática (la que tenga ticket)", value="auto",
+                            variable=self.mode, command=self._mode_changed).pack(anchor="w")
+            for i in cam_indices:
+                ttk.Radiobutton(self.mode_box, text=f"Cámara {i}", value=str(i),
+                                variable=self.mode, command=self._mode_changed).pack(anchor="w")
+        else:
+            ttk.Label(self.mode_box, text=f"Cámara {cam_indices[0]} (única disponible)").pack(anchor="w")
+
+        for i in cam_indices:
+            img = tk.Label(self.thumbs_box, bg="black", width=THUMB_W, height=THUMB_H)
+            img.pack(pady=(8, 0))
+            cap = ttk.Label(self.thumbs_box, text=f"Cámara {i}", style="Cam.TLabel")
+            cap.pack(anchor="w")
+            self.thumbs[i] = (img, cap)
 
     def log(self, msg: str) -> None:
         self.logbox.insert("end", f"[{datetime.now():%H:%M:%S}] {msg}\n")
@@ -235,7 +244,8 @@ class App:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Interfaz gráfica del lector de fechas de tickets.")
-    ap.add_argument("--cams", type=int, nargs="+", default=[0, 1])
+    ap.add_argument("--cams", type=int, nargs="+", default=None,
+                    help="índices de cámara (por defecto usa las que haya entre 0 y 1)")
     args = ap.parse_args()
     root = tk.Tk()
     App(root, args.cams)
