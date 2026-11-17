@@ -263,20 +263,34 @@ MONTHS = {
 }
 
 # Separadores que el OCR suele devolver en lugar de "-" o "/" (guiones Unicode, _, ~, ",")
-_SEP_CHARS = "/\\-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212_~,"
-SEP = rf"\s*[{_SEP_CHARS}]\s*"
+_SEP_CHARS = "/\\\\\\-.\u2010\u2011\u2012\u2013\u2014\u2015\u2212_~,"
 # Año de 4 cifras: no puede ir seguido de otra cifra, salvo que sea la hora pegada
 # ("09-11-202614:35"). El de 2 cifras no puede ir seguido de cifra.
-_YEAR = r"(\d{4}(?:(?!\d)|(?=\d{1,2}[:.h]\d{2}))|\d{2}(?!\d))"
+_YEAR = r"(?P<y>\d{4}(?:(?!\d)|(?=\d{1,2}[:.h]\d{2}))|\d{2}(?!\d))"
+# Los dos separadores de una fecha deben ser el mismo (tras normalizar con _fix_ocr_digits
+# quedan "/" o "-"): así en "23-  06/09/2025" (caja 23) no se lee 23/06/09.
+def _dmy_regex(day: str) -> re.Pattern:
+    return re.compile(
+        rf"(?P<d>{day})\s*(?P<s>[{_SEP_CHARS}])\s*(?P<mo>\d{{1,2}})\s*(?P=s)\s*{_YEAR}"
+    )
+
+
 # dd/mm/aaaa  dd-mm-aa  dd.mm.aaaa  (también d/m/aa)
-RE_DMY = re.compile(rf"(?<!\d)(\d{{1,2}}){SEP}(\d{{1,2}}){SEP}{_YEAR}")
+RE_DMY = _dmy_regex(r"(?<!\d)\d{1,2}")
 # Igual pero permitiendo cifras delante ("T0109-11-2026"): sólo se usa si lo anterior no encuentra nada
-RE_DMY_LOOSE = re.compile(rf"(\d{{2}}){SEP}(\d{{1,2}}){SEP}{_YEAR}")
+RE_DMY_LOOSE = _dmy_regex(r"\d{2}")
 # 17 NOV 2026 / 17-NOV-26 / 12 de enero de 2024
 RE_DMONY = re.compile(
     r"(?<!\d)(\d{1,2})\s*(?:DE\s+|[/\-.\s])?\s*("
     + "|".join(MONTHS)
     + r")[A-Z]*\.?\s*(?:DE\s+|[/\-.\s])?\s*(\d{4}|\d{2})(?!\d)"
+)
+# dd/mm/aaaa con la barra mal leída por el OCR como 1, l, I, | o !  ("22109/2025", "22l09l2025").
+# Exige día y mes de 2 cifras y año de 4 para no confundirlo con otros números.
+_SLASH_LIKE = r"[/\\1lI|!]"
+RE_DMY_SLASH = re.compile(
+    rf"(?<![\dA-Z])([\dOo]{{2}})({_SLASH_LIKE})([\dOo]{{2}})({_SLASH_LIKE})(\d{{4}}|[\dOoZ]{{4}})"
+    r"(?:(?!\d)|(?=\d{1,2}[:.h]\d{2}))"
 )
 KEYWORDS = ("FECHA", "FEC.", "FEC:", "DATA")
 
@@ -292,7 +306,7 @@ def _fix_ocr_digits(text: str) -> str:
     así las posiciones siguen valiendo para dibujar."""
     def fix(m: re.Match) -> str:
         t = m.group(0).translate(_OCR_FIX)
-        return re.sub(rf"[{_SEP_CHARS}]", lambda c: "/" if c.group(0) == "/" else "-", t)
+        return re.sub(rf"[{_SEP_CHARS}]", lambda c: "/" if c.group(0) in "/\\" else "-", t)
 
     return re.sub(
         rf"[{_OCR_CHARS}]{{1,6}}(?:\s*[{_SEP_CHARS}]\s*[{_OCR_CHARS}]{{1,6}}){{2}}",
@@ -320,24 +334,36 @@ class DateMatch:
     start: int        # posición dentro del texto de la línea
     end: int
     keyword: bool     # junto a "FECHA"
+    guess: bool = False  # sacada de una barra mal leída (menos fiable)
 
 
 def extract_dates(texts: list[str]) -> list[DateMatch]:
     found: list[DateMatch] = []
     for i, raw in enumerate(texts):
         up = raw.upper()
-        has_kw = any(k in up for k in KEYWORDS) or (
+        kw_here = any(k in up for k in KEYWORDS)
+        has_kw = kw_here or (
             i > 0 and any(k in texts[i - 1].upper() for k in KEYWORDS)
         )
         fixed = _fix_ocr_digits(raw).upper()
         n_before = len(found)
         for rx in (RE_DMY, RE_DMY_LOOSE):
             for m in rx.finditer(fixed):
-                dt = _make_date(int(m.group(1)), int(m.group(2)), int(m.group(3)[:4]))
+                dt = _make_date(int(m.group("d")), int(m.group("mo")), int(m.group("y")[:4]))
                 if dt:
                     found.append(DateMatch(dt, m.group(0), i, m.start(), m.end(), has_kw))
             if len(found) > n_before:
                 break
+        if len(found) == n_before:
+            for m in RE_DMY_SLASH.finditer(raw):
+                # Si las dos "barras" son un 1 podría ser cualquier número: sólo con "FECHA" cerca
+                if m.group(2) == m.group(4) == "1" and not kw_here:
+                    continue
+                d, mo, y = (int(m.group(k).translate(_OCR_FIX)) for k in (1, 3, 5))
+                dt = _make_date(d, mo, y)
+                if dt:
+                    raw_txt = f"{m.group(1)}/{m.group(3)}/{m.group(5)}".translate(_OCR_FIX)
+                    found.append(DateMatch(dt, raw_txt, i, m.start(), m.end(), has_kw, guess=True))
         for m in RE_DMONY.finditer(up):
             dt = _make_date(int(m.group(1)), MONTHS[m.group(2)], int(m.group(3)))
             if dt:
@@ -350,8 +376,10 @@ def best_date(candidates: list[DateMatch]) -> DateMatch | None:
         return None
     today = date.today()
     counts = Counter(c.value for c in candidates)
-    # Prioridad: junto a "FECHA", no futura, la más repetida
-    return max(candidates, key=lambda c: (c.keyword, c.value <= today, counts[c.value]))
+    # Prioridad: fecha bien escrita (no adivinada), junto a "FECHA", no futura,
+    # la más repetida y, a igualdad, la más reciente
+    return max(candidates, key=lambda c: (not c.guess, c.keyword, c.value <= today,
+                                          counts[c.value], c.value))
 
 
 def match_box(line: OCRLine, m: DateMatch) -> np.ndarray:
